@@ -1,0 +1,506 @@
+name: PanVK WSI Diagnostic v2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Install Android SDK
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/example/panvkwsi app/src/main/cpp
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PanVK-Diagnostic-v2"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.panvkwsi'
+              compileSdk 35
+              ndkVersion '27.2.12479018'
+
+              defaultConfig {
+                  applicationId 'com.example.panvkwsi.diagnostic'
+                  minSdk 26
+                  targetSdk 28
+                  versionCode 2
+                  versionName '2.0'
+                  externalNativeBuild {
+                      cmake {
+                          cppFlags '-std=c++17'
+                      }
+                  }
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path 'src/main/cpp/CMakeLists.txt'
+                      version '3.22.1'
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature
+                  android:name="android.hardware.vulkan.version"
+                  android:version="0x00400000"
+                  android:required="false" />
+              <application
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:label="PanVK Diagnostic v2">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="landscape"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/panvkwsi/MainActivity.java <<'EOF'
+          package com.example.panvkwsi;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.Surface;
+          import android.view.SurfaceHolder;
+          import android.view.SurfaceView;
+          import android.widget.TextView;
+          import android.widget.LinearLayout;
+          import android.graphics.Color;
+
+          public class MainActivity extends Activity implements SurfaceHolder.Callback {
+              static {
+                  System.loadLibrary("panvkwsi");
+              }
+
+              private TextView status;
+              private boolean started = false;
+
+              private native String runDiagnostic(Surface surface);
+
+              @Override
+              public void onCreate(Bundle b) {
+                  super.onCreate(b);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  status = new TextView(this);
+                  status.setTextColor(Color.WHITE);
+                  status.setTextSize(13);
+                  status.setPadding(16, 16, 16, 16);
+                  status.setText("PanVK Diagnostic v2\nОжидание Surface...");
+                  root.addView(status, new LinearLayout.LayoutParams(-1, -2));
+
+                  SurfaceView view = new SurfaceView(this);
+                  root.addView(view, new LinearLayout.LayoutParams(-1, 0, 1));
+
+                  setContentView(root);
+                  view.getHolder().addCallback(this);
+              }
+
+              @Override
+              public void surfaceCreated(SurfaceHolder holder) {
+                  if (started) return;
+                  started = true;
+
+                  Surface s = holder.getSurface();
+                  status.setText("Выполняется диагностика Vulkan...");
+
+                  new Thread(() -> {
+                      String result = runDiagnostic(s);
+                      runOnUiThread(() -> status.setText(result));
+                  }).start();
+              }
+
+              @Override
+              public void surfaceChanged(SurfaceHolder h, int f, int w, int he) {}
+
+              @Override
+              public void surfaceDestroyed(SurfaceHolder h) {}
+          }
+          EOF
+
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(panvkwsi)
+
+          add_library(panvkwsi SHARED native-lib.cpp)
+
+          find_library(log-lib log)
+          find_library(android-lib android)
+
+          target_link_libraries(panvkwsi ${log-lib} ${android-lib} vulkan)
+          EOF
+
+          cat > app/src/main/cpp/native-lib.cpp <<'EOF'
+          #include <jni.h>
+          #include <android/native_window_jni.h>
+          #define VK_USE_PLATFORM_ANDROID_KHR
+          #include <vulkan/vulkan.h>
+          #include <android/log.h>
+          #include <vector>
+          #include <string>
+          #include <sstream>
+          #include <algorithm>
+
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PanVK_DIAG_V2", __VA_ARGS__)
+
+          static void logLine(std::ostringstream& out, const std::string& s) {
+              out << s << "\n";
+              LOGI("%s", s.c_str());
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_example_panvkwsi_MainActivity_runDiagnostic(
+              JNIEnv* env, jobject, jobject surface) {
+
+              std::ostringstream out;
+              ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+
+              if (!window) return env->NewStringUTF("ANativeWindow failed");
+
+              VkInstance instance = VK_NULL_HANDLE;
+              VkSurfaceKHR vkSurface = VK_NULL_HANDLE;
+              VkDevice device = VK_NULL_HANDLE;
+              VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+
+              auto result = [&](const char* name, VkResult r) {
+                  std::ostringstream s;
+                  s << name << ": " << static_cast<int>(r);
+                  logLine(out, s.str());
+              };
+
+              do {
+                  VkApplicationInfo ai{};
+                  ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+                  ai.pApplicationName = "PanVK Diagnostic v2";
+                  ai.apiVersion = VK_API_VERSION_1_0;
+
+                  const char* ie[] = {
+                      VK_KHR_SURFACE_EXTENSION_NAME,
+                      VK_KHR_ANDROID_SURFACE_EXTENSION_NAME
+                  };
+
+                  VkInstanceCreateInfo ici{};
+                  ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+                  ici.pApplicationInfo = &ai;
+                  ici.enabledExtensionCount = 2;
+                  ici.ppEnabledExtensionNames = ie;
+
+                  VkResult r = vkCreateInstance(&ici, nullptr, &instance);
+                  if (r != VK_SUCCESS) {
+                      result("vkCreateInstance", r);
+                      break;
+                  }
+
+                  uint32_t count = 0;
+                  vkEnumeratePhysicalDevices(instance, &count, nullptr);
+                  if (!count) {
+                      logLine(out, "No Vulkan GPU");
+                      break;
+                  }
+
+                  std::vector<VkPhysicalDevice> gpus(count);
+                  vkEnumeratePhysicalDevices(instance, &count, gpus.data());
+                  VkPhysicalDevice gpu = gpus[0];
+
+                  VkPhysicalDeviceProperties props{};
+                  vkGetPhysicalDeviceProperties(gpu, &props);
+                  logLine(out, std::string("GPU: ") + props.deviceName);
+
+                  uint32_t extCount = 0;
+                  vkEnumerateDeviceExtensionProperties(gpu, nullptr, &extCount, nullptr);
+                  std::vector<VkExtensionProperties> exts(extCount);
+                  vkEnumerateDeviceExtensionProperties(gpu, nullptr, &extCount, exts.data());
+
+                  logLine(out, "DEVICE EXTENSIONS:");
+                  for (const auto& e : exts) {
+                      std::string n = e.extensionName;
+                      if (n.find("external") != std::string::npos ||
+                          n.find("android") != std::string::npos ||
+                          n.find("dma_buf") != std::string::npos ||
+                          n.find("drm") != std::string::npos) {
+                          logLine(out, n);
+                      }
+                  }
+
+                  VkAndroidSurfaceCreateInfoKHR sci{};
+                  sci.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+                  sci.window = window;
+
+                  r = vkCreateAndroidSurfaceKHR(instance, &sci, nullptr, &vkSurface);
+                  if (r != VK_SUCCESS) {
+                      result("vkCreateAndroidSurfaceKHR", r);
+                      break;
+                  }
+
+                  uint32_t qcount = 0;
+                  vkGetPhysicalDeviceQueueFamilyProperties(gpu, &qcount, nullptr);
+                  std::vector<VkQueueFamilyProperties> qprops(qcount);
+                  vkGetPhysicalDeviceQueueFamilyProperties(gpu, &qcount, qprops.data());
+
+                  uint32_t qf = UINT32_MAX;
+                  for (uint32_t i = 0; i < qcount; i++) {
+                      VkBool32 present = VK_FALSE;
+                      vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, vkSurface, &present);
+                      if (present && (qprops[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                          qf = i;
+                          break;
+                      }
+                  }
+
+                  if (qf == UINT32_MAX) {
+                      logLine(out, "No graphics + present queue");
+                      break;
+                  }
+
+                  VkSurfaceCapabilitiesKHR caps{};
+                  r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, vkSurface, &caps);
+                  if (r != VK_SUCCESS) {
+                      result("Surface capabilities", r);
+                      break;
+                  }
+
+                  {
+                      std::ostringstream s;
+                      s << "Surface current extent: " << caps.currentExtent.width
+                        << "x" << caps.currentExtent.height;
+                      logLine(out, s.str());
+                  }
+                  {
+                      std::ostringstream s;
+                      s << "Min extent: " << caps.minImageExtent.width << "x"
+                        << caps.minImageExtent.height << " | Max extent: "
+                        << caps.maxImageExtent.width << "x" << caps.maxImageExtent.height;
+                      logLine(out, s.str());
+                  }
+                  {
+                      std::ostringstream s;
+                      s << "Image count min/max: " << caps.minImageCount << "/"
+                        << caps.maxImageCount;
+                      logLine(out, s.str());
+                  }
+                  {
+                      std::ostringstream s;
+                      s << "Supported imageUsage flags: 0x" << std::hex
+                        << caps.supportedUsageFlags;
+                      logLine(out, s.str());
+                  }
+
+                  uint32_t fc = 0;
+                  vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, vkSurface, &fc, nullptr);
+                  std::vector<VkSurfaceFormatKHR> formats(fc);
+                  vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, vkSurface, &fc, formats.data());
+
+                  logLine(out, "SURFACE FORMATS:");
+                  for (const auto& f : formats) {
+                      std::ostringstream s;
+                      s << "format=" << f.format << " colorspace=" << f.colorSpace;
+                      logLine(out, s.str());
+                  }
+
+                  uint32_t mc = 0;
+                  vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, vkSurface, &mc, nullptr);
+                  std::vector<VkPresentModeKHR> modes(mc);
+                  vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, vkSurface, &mc, modes.data());
+
+                  logLine(out, "Present modes:");
+                  for (auto m : modes) {
+                      std::ostringstream s;
+                      s << static_cast<int>(m);
+                      logLine(out, s.str());
+                  }
+
+                  float priority = 1.0f;
+                  VkDeviceQueueCreateInfo qi{};
+                  qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+                  qi.queueFamilyIndex = qf;
+                  qi.queueCount = 1;
+                  qi.pQueuePriorities = &priority;
+
+                  const char* de[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+                  VkDeviceCreateInfo dci{};
+                  dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+                  dci.queueCreateInfoCount = 1;
+                  dci.pQueueCreateInfos = &qi;
+                  dci.enabledExtensionCount = 1;
+                  dci.ppEnabledExtensionNames = de;
+
+                  r = vkCreateDevice(gpu, &dci, nullptr, &device);
+                  if (r != VK_SUCCESS) {
+                      result("vkCreateDevice", r);
+                      break;
+                  }
+
+                  VkSurfaceFormatKHR chosen{};
+                  bool found = false;
+                  for (const auto& f : formats) {
+                      if (f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+                          chosen = f;
+                          found = true;
+                          break;
+                      }
+                  }
+                  if (!found) {
+                      logLine(out, "RGBA8 format not advertised");
+                      break;
+                  }
+
+                  VkExtent2D extent = caps.currentExtent;
+                  if (extent.width == UINT32_MAX) {
+                      extent.width = ANativeWindow_getWidth(window);
+                      extent.height = ANativeWindow_getHeight(window);
+                  }
+
+                  VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+                  const VkCompositeAlphaFlagBitsKHR alphas[] = {
+                      VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                      VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                      VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                      VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR
+                  };
+                  for (auto a : alphas) {
+                      if (caps.supportedCompositeAlpha & a) {
+                          alpha = a;
+                          break;
+                      }
+                  }
+
+                  VkQueue queue = VK_NULL_HANDLE;
+                  vkGetDeviceQueue(device, qf, 0, &queue);
+
+                  const VkImageUsageFlags usages[] = {
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                  };
+
+                  logLine(out, "SWAPCHAIN ATTEMPTS (RGBA8, FIFO):");
+
+                  for (auto usage : usages) {
+                      if ((caps.supportedUsageFlags & usage) != usage) {
+                          std::ostringstream s;
+                          s << "SKIP unsupported usage=0x" << std::hex << usage;
+                          logLine(out, s.str());
+                          continue;
+                      }
+
+                      uint32_t imageCount = 6;
+                      if (imageCount < caps.minImageCount) imageCount = caps.minImageCount;
+                      if (caps.maxImageCount && imageCount > caps.maxImageCount)
+                          imageCount = caps.maxImageCount;
+
+                      VkSwapchainCreateInfoKHR ci{};
+                      ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+                      ci.surface = vkSurface;
+                      ci.minImageCount = imageCount;
+                      ci.imageFormat = chosen.format;
+                      ci.imageColorSpace = chosen.colorSpace;
+                      ci.imageExtent = extent;
+                      ci.imageArrayLayers = 1;
+                      ci.imageUsage = usage;
+                      ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                      ci.preTransform = caps.currentTransform;
+                      ci.compositeAlpha = alpha;
+                      ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+                      ci.clipped = VK_TRUE;
+
+                      VkSwapchainKHR test = VK_NULL_HANDLE;
+                      r = vkCreateSwapchainKHR(device, &ci, nullptr, &test);
+
+                      std::ostringstream s;
+                      s << "usage=0x" << std::hex << usage
+                        << " images=" << std::dec << imageCount
+                        << " extent=" << extent.width << "x" << extent.height
+                        << " result=" << r;
+                      logLine(out, s.str());
+
+                      if (r == VK_SUCCESS) {
+                          vkDestroySwapchainKHR(device, test, nullptr);
+                      }
+                  }
+
+                  logLine(out, "DIAGNOSTIC FINISHED");
+              } while (false);
+
+              if (device) vkDestroyDevice(device, nullptr);
+              if (vkSurface) vkDestroySurfaceKHR(instance, vkSurface, nullptr);
+              if (instance) vkDestroyInstance(instance, nullptr);
+              ANativeWindow_release(window);
+
+              return env->NewStringUTF(out.str().c_str());
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload diagnostic APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-diagnostic-v2-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
