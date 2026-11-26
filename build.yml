@@ -1,0 +1,309 @@
+name: Build PanVK WSI Test APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Generate diagnostic Android project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/example/panvkwsi app/src/main/cpp
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "PanVK-WSI-Test"
+          include(":app")
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.example.panvkwsi'
+              compileSdk 35
+              ndkVersion '27.2.12479018'
+              defaultConfig {
+                  applicationId 'com.example.panvkwsi'
+                  minSdk 26
+                  targetSdk 28
+                  versionCode 1
+                  versionName '1.0'
+                  externalNativeBuild {
+                      cmake { cppFlags '-std=c++17 -Wall -Wextra' }
+                  }
+              }
+              externalNativeBuild {
+                  cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' }
+              }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00400000" android:required="false" />
+              <application android:theme="@android:style/Theme.Material.Light.NoActionBar" android:label="PanVK WSI Test" android:hasCode="true">
+                  <activity android:name=".MainActivity" android:screenOrientation="landscape" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/panvkwsi/MainActivity.java <<'EOF'
+          package com.example.panvkwsi;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.Surface;
+          import android.view.SurfaceHolder;
+          import android.view.SurfaceView;
+          import android.widget.TextView;
+          import android.widget.LinearLayout;
+          import android.view.ViewGroup;
+          import android.graphics.Color;
+
+          public class MainActivity extends Activity implements SurfaceHolder.Callback {
+              static { System.loadLibrary("panvkwsi"); }
+              private TextView status;
+              private boolean started = false;
+              private native String testSurface(Surface surface);
+              @Override public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().getDecorView().setSystemUiVisibility(5894 | 1024 | 512);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.rgb(20,20,20));
+                  status = new TextView(this);
+                  status.setTextColor(Color.WHITE);
+                  status.setTextSize(16);
+                  status.setPadding(24,24,24,24);
+                  status.setText("PanVK WSI Test\nОжидание Android Surface...");
+                  root.addView(status, new LinearLayout.LayoutParams(-1, -2));
+                  SurfaceView view = new SurfaceView(this);
+                  root.addView(view, new LinearLayout.LayoutParams(-1, 0, 1));
+                  setContentView(root);
+                  view.getHolder().addCallback(this);
+              }
+              @Override public void surfaceCreated(SurfaceHolder h) {
+                  if (!started) {
+                      started = true;
+                      status.setText("Выполняется Vulkan-тест...\nПодробности: adb logcat -s PanVK_WSI_TEST");
+                      new Thread(() -> {
+                          String result = testSurface(h.getSurface());
+                          runOnUiThread(() -> status.setText(result));
+                      }).start();
+                  }
+              }
+              @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int he) {}
+              @Override public void surfaceDestroyed(SurfaceHolder h) {}
+          }
+          EOF
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(panvkwsi)
+          add_library(panvkwsi SHARED native-lib.cpp)
+          find_library(log-lib log)
+          find_library(android-lib android)
+          target_link_libraries(panvkwsi ${log-lib} ${android-lib} vulkan)
+          EOF
+          cat > app/src/main/cpp/native-lib.cpp <<'EOF'
+          #include <jni.h>
+          #include <android/native_window_jni.h>
+          #include <vulkan/vulkan.h>
+          #include <android/log.h>
+          #include <vector>
+          #include <string>
+          #include <sstream>
+          #include <algorithm>
+
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PanVK_WSI_TEST", __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PanVK_WSI_TEST", __VA_ARGS__)
+
+          static std::string resultText;
+          static void say(std::ostringstream& s, const std::string& m) { s << m << "\n"; LOGI("%s", m.c_str()); }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_example_panvkwsi_MainActivity_testSurface(JNIEnv* env, jobject, jobject surface) {
+              std::ostringstream out;
+              VkInstance instance = VK_NULL_HANDLE;
+              VkDevice device = VK_NULL_HANDLE;
+              VkSurfaceKHR vkSurface = VK_NULL_HANDLE;
+              VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+              VkSemaphore acquired = VK_NULL_HANDLE, rendered = VK_NULL_HANDLE;
+              ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+              if (!window) return env->NewStringUTF("ОШИБКА: ANativeWindow_fromSurface");
+              auto fail = [&](const char* where, VkResult r) {
+                  std::ostringstream e; e << "ОШИБКА " << where << ": VkResult=" << (int)r;
+                  say(out, e.str());
+              };
+              VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+              ai.pApplicationName = "PanVK WSI Test"; ai.apiVersion = VK_API_VERSION_1_0;
+              const char* ie[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
+              VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+              ici.pApplicationInfo = &ai; ici.enabledExtensionCount = 2; ici.ppEnabledExtensionNames = ie;
+              VkResult r = vkCreateInstance(&ici, nullptr, &instance);
+              if (r != VK_SUCCESS) { fail("vkCreateInstance", r); goto done; }
+              {
+                  uint32_t n=0; vkEnumeratePhysicalDevices(instance, &n, nullptr);
+                  if (!n) { say(out, "ОШИБКА: Vulkan physical devices не найдены"); goto done; }
+                  std::vector<VkPhysicalDevice> pds(n); vkEnumeratePhysicalDevices(instance, &n, pds.data());
+                  VkPhysicalDevice pd = pds[0];
+                  VkPhysicalDeviceProperties props{}; vkGetPhysicalDeviceProperties(pd, &props);
+                  say(out, std::string("GPU: ") + props.deviceName);
+                  uint32_t qn=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&qn,nullptr);
+                  std::vector<VkQueueFamilyProperties> qps(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd,&qn,qps.data());
+                  uint32_t q=UINT32_MAX;
+                  for(uint32_t i=0;i<qn;i++) if(qps[i].queueCount && (qps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { q=i; break; }
+                  if(q==UINT32_MAX) { say(out,"ОШИБКА: нет graphics queue"); goto done; }
+                  VkAndroidSurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+                  sci.window=window;
+                  r=vkCreateAndroidSurfaceKHR(instance,&sci,nullptr,&vkSurface);
+                  if(r!=VK_SUCCESS) { fail("vkCreateAndroidSurfaceKHR",r); goto done; }
+                  VkBool32 present=VK_FALSE; vkGetPhysicalDeviceSurfaceSupportKHR(pd,q,vkSurface,&present);
+                  say(out, std::string("Present support: ") + (present?"YES":"NO"));
+                  if(!present) { say(out,"ОШИБКА: graphics queue не поддерживает present"); goto done; }
+                  uint32_t fn=0; vkGetPhysicalDeviceSurfaceFormatsKHR(pd,vkSurface,&fn,nullptr);
+                  if(!fn) { say(out,"ОШИБКА: surface formats пусты"); goto done; }
+                  std::vector<VkSurfaceFormatKHR> formats(fn); vkGetPhysicalDeviceSurfaceFormatsKHR(pd,vkSurface,&fn,formats.data());
+                  VkSurfaceFormatKHR chosen=formats[0];
+                  for(auto f:formats) if(f.format==VK_FORMAT_R8G8B8A8_UNORM || f.format==VK_FORMAT_B8G8R8A8_UNORM) { chosen=f; break; }
+                  { std::ostringstream x; x<<"Surface formats: "<<fn<<", выбран format="<<chosen.format<<" colorspace="<<chosen.colorSpace; say(out,x.str()); }
+                  VkSurfaceCapabilitiesKHR caps{}; r=vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd,vkSurface,&caps);
+                  if(r!=VK_SUCCESS) { fail("vkGetPhysicalDeviceSurfaceCapabilitiesKHR",r); goto done; }
+                  uint32_t pmn=0; vkGetPhysicalDeviceSurfacePresentModesKHR(pd,vkSurface,&pmn,nullptr);
+                  std::vector<VkPresentModeKHR> modes(pmn); if(pmn) vkGetPhysicalDeviceSurfacePresentModesKHR(pd,vkSurface,&pmn,modes.data());
+                  bool fifo=std::find(modes.begin(),modes.end(),VK_PRESENT_MODE_FIFO_KHR)!=modes.end();
+                  say(out, std::string("FIFO present mode: ")+(fifo?"YES":"NO"));
+                  if(!fifo) { say(out,"ОШИБКА: FIFO отсутствует"); goto done; }
+                  float priority=1.0f;
+                  VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qci.queueFamilyIndex=q; qci.queueCount=1; qci.pQueuePriorities=&priority;
+                  const char* de[]={VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+                  VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount=1; dci.pQueueCreateInfos=&qci; dci.enabledExtensionCount=1; dci.ppEnabledExtensionNames=de;
+                  r=vkCreateDevice(pd,&dci,nullptr,&device); if(r!=VK_SUCCESS) { fail("vkCreateDevice",r); goto done; }
+                  VkQueue queue; vkGetDeviceQueue(device,q,0,&queue);
+                  VkExtent2D extent=caps.currentExtent;
+                  if(extent.width==UINT32_MAX) { extent.width=std::max(caps.minImageExtent.width,1u); extent.height=std::max(caps.minImageExtent.height,1u); }
+                  uint32_t count=std::max(caps.minImageCount,2u); if(caps.maxImageCount && count>caps.maxImageCount) count=caps.maxImageCount;
+                  VkSwapchainCreateInfoKHR sw{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+                  sw.surface=vkSurface; sw.minImageCount=count; sw.imageFormat=chosen.format; sw.imageColorSpace=chosen.colorSpace;
+                  sw.imageExtent=extent; sw.imageArrayLayers=1; sw.imageUsage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                  if(!(caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+                      if(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) sw.imageUsage=VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                      else { say(out,"ОШИБКА: surface не поддерживает COLOR_ATTACHMENT или TRANSFER_DST"); goto done; }
+                  }
+                  sw.imageSharingMode=VK_SHARING_MODE_EXCLUSIVE; sw.preTransform=caps.currentTransform;
+                  sw.compositeAlpha=(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)?VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR:VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+                  sw.presentMode=VK_PRESENT_MODE_FIFO_KHR; sw.clipped=VK_TRUE;
+                  r=vkCreateSwapchainKHR(device,&sw,nullptr,&swapchain);
+                  if(r!=VK_SUCCESS) { fail("vkCreateSwapchainKHR",r); goto done; }
+                  say(out,"vkCreateSwapchainKHR: SUCCESS");
+                  VkSemaphoreCreateInfo sem{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+                  r=vkCreateSemaphore(device,&sem,nullptr,&acquired); if(r!=VK_SUCCESS) { fail("vkCreateSemaphore(acquire)",r); goto done; }
+                  r=vkCreateSemaphore(device,&sem,nullptr,&rendered); if(r!=VK_SUCCESS) { fail("vkCreateSemaphore(render)",r); goto done; }
+                  VkCommandPool pool=VK_NULL_HANDLE;
+                  VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                  pci.queueFamilyIndex=q;
+                  r=vkCreateCommandPool(device,&pci,nullptr,&pool);
+                  if(r!=VK_SUCCESS) { fail("vkCreateCommandPool",r); goto done; }
+                  VkCommandBuffer cmd=VK_NULL_HANDLE;
+                  VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                  cai.commandPool=pool; cai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount=1;
+                  r=vkAllocateCommandBuffers(device,&cai,&cmd);
+                  if(r!=VK_SUCCESS) { fail("vkAllocateCommandBuffers",r); vkDestroyCommandPool(device,pool,nullptr); goto done; }
+                  for(int i=0;i<3;i++) {
+                      uint32_t image=0; r=vkAcquireNextImageKHR(device,swapchain,UINT64_MAX,acquired,VK_NULL_HANDLE,&image);
+                      if(r!=VK_SUCCESS && r!=VK_SUBOPTIMAL_KHR) { fail("vkAcquireNextImageKHR",r); break; }
+                      vkResetCommandBuffer(cmd,0);
+                      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                      bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                      r=vkBeginCommandBuffer(cmd,&bi);
+                      if(r!=VK_SUCCESS) { fail("vkBeginCommandBuffer",r); break; }
+                      uint32_t imageCount=0; vkGetSwapchainImagesKHR(device,swapchain,&imageCount,nullptr);
+                      std::vector<VkImage> swapImages(imageCount); vkGetSwapchainImagesKHR(device,swapchain,&imageCount,swapImages.data());
+                      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                      barrier.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED; barrier.newLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                      barrier.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+                      barrier.image=swapImages[image];
+                      barrier.subresourceRange.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+                      barrier.subresourceRange.baseMipLevel=0; barrier.subresourceRange.levelCount=1;
+                      barrier.subresourceRange.baseArrayLayer=0; barrier.subresourceRange.layerCount=1;
+                      vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+                      r=vkEndCommandBuffer(cmd);
+                      if(r!=VK_SUCCESS) { fail("vkEndCommandBuffer",r); break; }
+                      VkPipelineStageFlags stage=VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.waitSemaphoreCount=1; submit.pWaitSemaphores=&acquired;
+                      submit.pWaitDstStageMask=&stage; submit.commandBufferCount=1; submit.pCommandBuffers=&cmd;
+                      submit.signalSemaphoreCount=1; submit.pSignalSemaphores=&rendered;
+                      r=vkQueueSubmit(queue,1,&submit,VK_NULL_HANDLE); if(r!=VK_SUCCESS) { fail("vkQueueSubmit",r); break; }
+                      VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR}; pi.waitSemaphoreCount=1; pi.pWaitSemaphores=&rendered;
+                      pi.swapchainCount=1; pi.pSwapchains=&swapchain; pi.pImageIndices=&image;
+                      r=vkQueuePresentKHR(queue,&pi); if(r!=VK_SUCCESS && r!=VK_SUBOPTIMAL_KHR) { fail("vkQueuePresentKHR",r); goto done; }
+                      { std::ostringstream x; x<<"Present cycle "<<(i+1)<<": SUCCESS"; say(out,x.str()); }
+                      vkQueueWaitIdle(queue);
+                  }
+                  if(i==2) say(out,"RESULT: PASS — Vulkan swapchain создан, acquire/present прошли.");
+                  }
+                  vkDestroyCommandPool(device,pool,nullptr);
+              }
+          done:
+              if(device) { if(acquired) vkDestroySemaphore(device,acquired,nullptr); if(rendered) vkDestroySemaphore(device,rendered,nullptr); if(swapchain) vkDestroySwapchainKHR(device,swapchain,nullptr); vkDeviceWaitIdle(device); vkDestroyDevice(device,nullptr); }
+              if(instance) { if(vkSurface) vkDestroySurfaceKHR(instance,vkSurface,nullptr); vkDestroyInstance(instance,nullptr); }
+              ANativeWindow_release(window);
+              std::string s=out.str();
+              return env->NewStringUTF(s.c_str());
+          }
+          EOF
+          cat > README_RU.txt <<'EOF'
+          PanVK WSI Test — автоматическая сборка APK через GitHub Actions
+
+          1. Создай пустой репозиторий на GitHub.
+          2. В репозитории нажми Add file -> Create new file.
+          3. В имени файла укажи ТОЧНО: .github/workflows/build.yml
+          4. Открой скачанный build.yml и скопируй весь текст в редактор GitHub.
+          5. Нажми Commit changes.
+          6. Открой Actions -> Build PanVK WSI Test APK. Если workflow не стартовал автоматически, нажми Run workflow.
+          7. Открой завершённый запуск и скачай Artifact panvk-wsi-test-apk.
+          8. Распакуй artifact ZIP и установи app-debug.apk на телефон.
+
+          На телефоне открой приложение и дождись результата.
+          Для подробного лога: adb logcat -s PanVK_WSI_TEST
+          Примечание: тест создаёт swapchain и выполняет acquire/present. Он не рисует содержимое кадра;
+          проверяется именно Android WSI, что нужно для отделения проблемы PanVK от DXVK.
+          EOF
+
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-wsi-test-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
