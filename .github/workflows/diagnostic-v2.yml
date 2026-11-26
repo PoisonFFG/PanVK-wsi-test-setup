@@ -124,6 +124,7 @@ jobs:
           import android.view.SurfaceHolder;
           import android.view.SurfaceView;
           import android.widget.TextView;
+          import android.widget.ScrollView;
           import android.widget.LinearLayout;
           import android.graphics.Color;
 
@@ -145,15 +146,25 @@ jobs:
                   root.setOrientation(LinearLayout.VERTICAL);
                   root.setBackgroundColor(Color.BLACK);
 
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setFillViewport(true);
+
                   status = new TextView(this);
                   status.setTextColor(Color.WHITE);
                   status.setTextSize(13);
                   status.setPadding(16, 16, 16, 16);
                   status.setText("PanVK Diagnostic v2\nОжидание Surface...");
-                  root.addView(status, new LinearLayout.LayoutParams(-1, -2));
+
+                  scroll.addView(status);
+
+                  root.addView(scroll, new LinearLayout.LayoutParams(
+                      -1, 0, 1
+                  ));
 
                   SurfaceView view = new SurfaceView(this);
-                  root.addView(view, new LinearLayout.LayoutParams(-1, 0, 1));
+                  root.addView(view, new LinearLayout.LayoutParams(
+                      -1, 0, 1
+                  ));
 
                   setContentView(root);
                   view.getHolder().addCallback(this);
